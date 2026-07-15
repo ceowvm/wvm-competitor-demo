@@ -21,15 +21,9 @@ const errorPanel = document.querySelector("#error-panel");
 const errorMessage = document.querySelector("#error-message");
 
 let currentCompanies = [];
-let currentQuery = { niche: "", region: "" };
+let currentQuery = { niche: "", region: "", count: 0 };
 let progressTimer = null;
-
-const progressSteps = [
-  { percent: 15, title: "Ищем подходящие компании", description: "Формируем поисковые запросы по нише и региону." },
-  { percent: 38, title: "Проверяем официальные сайты", description: "Отсеиваем каталоги, агрегаторы и нерелевантные страницы." },
-  { percent: 62, title: "Собираем контактные данные", description: "Ищем телефон на сайте каждой компании." },
-  { percent: 82, title: "Проверяем результаты", description: "Удаляем дубли и готовим итоговую таблицу." },
-];
+let activeRunToken = 0;
 
 function clampCount(value) {
   const parsed = Number.parseInt(value, 10);
@@ -47,33 +41,40 @@ countInput.addEventListener("change", () => {
   countInput.value = clampCount(countInput.value);
 });
 
+function setProgress(percent, title, description) {
+  statusPercent.textContent = `${percent}%`;
+  progressBar.style.width = `${percent}%`;
+  statusTitle.textContent = title;
+  statusDescription.textContent = description;
+}
+
 function showStatus() {
   clearInterval(progressTimer);
-  let index = 0;
   statusPanel.classList.remove("is-hidden");
   resultsSection.classList.add("is-hidden");
   errorPanel.classList.add("is-hidden");
 
-  const renderStep = () => {
-    const step = progressSteps[index];
-    statusPercent.textContent = `${step.percent}%`;
-    progressBar.style.width = `${step.percent}%`;
-    statusTitle.textContent = step.title;
-    statusDescription.textContent = step.description;
-    if (index < progressSteps.length - 1) index += 1;
-  };
+  let percent = 8;
+  setProgress(percent, "Запускаем исследование", "Создаём фоновую задачу.");
 
-  renderStep();
-  progressTimer = setInterval(renderStep, 6500);
+  progressTimer = setInterval(() => {
+    percent = Math.min(88, percent + (percent < 55 ? 5 : 2));
+
+    if (percent < 35) {
+      setProgress(percent, "Ищем подходящие компании", "Формируем поисковые запросы по нише и региону.");
+    } else if (percent < 65) {
+      setProgress(percent, "Проверяем официальные сайты", "Отсеиваем каталоги, агрегаторы и нерелевантные страницы.");
+    } else {
+      setProgress(percent, "Собираем контактные данные", "Проверяем сайты, телефоны и удаляем дубли.");
+    }
+  }, 3500);
+
   statusPanel.scrollIntoView({ behavior: "smooth", block: "center" });
 }
 
 function finishStatus() {
   clearInterval(progressTimer);
-  statusPercent.textContent = "100%";
-  progressBar.style.width = "100%";
-  statusTitle.textContent = "Анализ завершён";
-  statusDescription.textContent = "Готовим таблицу к отображению.";
+  setProgress(100, "Анализ завершён", "Готовим таблицу к отображению.");
 }
 
 function resetButton() {
@@ -96,7 +97,7 @@ function normalizeUrl(value) {
   return /^https?:\/\//i.test(url) ? url : `https://${url}`;
 }
 
-function renderResults(companies, meta) {
+function renderResults(companies) {
   currentCompanies = companies;
   resultsBody.innerHTML = "";
 
@@ -116,10 +117,11 @@ function renderResults(companies, meta) {
     resultsBody.appendChild(row);
   });
 
-  const requested = meta?.requestedCount ?? companies.length;
-  resultsMeta.textContent = `Найдено ${companies.length} из ${requested}. Ниша: ${currentQuery.niche}. Регион: ${currentQuery.region}.`;
-  resultsSection.classList.remove("is-hidden");
+  resultsMeta.textContent =
+    `Найдено ${companies.length} из ${currentQuery.count}. ` +
+    `Ниша: ${currentQuery.niche}. Регион: ${currentQuery.region}.`;
 
+  resultsSection.classList.remove("is-hidden");
   window.setTimeout(() => {
     statusPanel.classList.add("is-hidden");
     resultsSection.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -135,6 +137,41 @@ function showError(message) {
   errorPanel.scrollIntoView({ behavior: "smooth", block: "center" });
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+async function postJson(url, payload) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || `Ошибка сервера: ${response.status}`);
+  return data;
+}
+
+async function waitForCompletion(responseId, requestedCount, runToken) {
+  const startedAt = Date.now();
+  const maxWaitMs = 5 * 60 * 1000;
+
+  while (Date.now() - startedAt < maxWaitMs) {
+    if (runToken !== activeRunToken) throw new Error("Анализ был остановлен новым запросом.");
+
+    await sleep(3000);
+    const data = await postJson("/api/analyze/status", { responseId, requestedCount });
+
+    if (data.status === "completed") return data.companies || [];
+    if (data.status !== "queued" && data.status !== "in_progress") {
+      throw new Error(data.error || `Анализ завершился со статусом ${data.status}.`);
+    }
+  }
+
+  throw new Error("Анализ выполняется дольше пяти минут. Попробуйте уменьшить количество компаний.");
+}
+
 function csvEscape(value) {
   const text = String(value ?? "").replaceAll('"', '""');
   return `"${text}"`;
@@ -145,11 +182,7 @@ function downloadCsv() {
 
   const rows = [
     ["Название", "Сайт", "Телефон"],
-    ...currentCompanies.map((company) => [
-      company.name || "",
-      company.website || "",
-      company.phone || "",
-    ]),
+    ...currentCompanies.map((company) => [company.name || "", company.website || "", company.phone || ""]),
   ];
 
   const csv = "\uFEFF" + rows.map((row) => row.map(csvEscape).join(";")).join("\r\n");
@@ -178,40 +211,33 @@ form.addEventListener("submit", async (event) => {
   const niche = nicheInput.value.trim();
   const region = regionInput.value.trim();
   const count = clampCount(countInput.value);
-
   if (!niche || !region) return;
 
-  currentQuery = { niche, region };
+  currentQuery = { niche, region, count };
+  activeRunToken += 1;
+  const runToken = activeRunToken;
+
   submitButton.disabled = true;
   submitButton.querySelector("span:first-child").textContent = "АНАЛИЗИРУЕМ…";
   showStatus();
 
   try {
-    const response = await fetch("/api/analyze", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ niche, region, count }),
-    });
+    const started = await postJson("/api/analyze/start", { niche, region, count });
+    if (!started.responseId) throw new Error("Сервер не вернул идентификатор анализа.");
 
-    const data = await response.json().catch(() => ({}));
+    setProgress(18, "Исследование запущено", "Задача выполняется в фоне. Страницу можно оставить открытой.");
 
-    if (!response.ok) {
-      throw new Error(data.error || `Ошибка сервера: ${response.status}`);
-    }
-
-    if (!Array.isArray(data.companies) || data.companies.length === 0) {
-      throw new Error("По заданным параметрам не удалось найти компании с подтверждёнными сайтами.");
+    const companies = await waitForCompletion(started.responseId, count, runToken);
+    if (!companies.length) {
+      throw new Error("По заданным параметрам не удалось найти компании с подтверждёнными официальными сайтами.");
     }
 
     finishStatus();
-    renderResults(data.companies, data.meta);
+    renderResults(companies);
   } catch (error) {
     console.error(error);
-    showError(
-      error?.message ||
-        "Произошла непредвиденная ошибка. Проверьте настройки API и повторите запрос."
-    );
+    showError(error?.message || "Произошла непредвиденная ошибка. Повторите запрос.");
   } finally {
-    resetButton();
+    if (runToken === activeRunToken) resetButton();
   }
 });
